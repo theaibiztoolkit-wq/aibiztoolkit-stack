@@ -1,0 +1,164 @@
+version: '2.1'
+services:
+  # PostgreSQL Database - foundation for NocoDB, N8N, and Metabase
+  postgres:
+    image: postgres:16.6
+    container_name: postgres-aibiztoolkit
+    restart: always
+    environment:
+      POSTGRES_DB: root_db
+      POSTGRES_PASSWORD: password
+      POSTGRES_USER: postgres
+      # Initialize additional databases on startup
+      POSTGRES_INITDB_ARGS: "-c max_connections=200"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    # Enhanced health check that verifies all three databases exist
+    healthcheck:
+      test: |
+        bash -c '
+        pg_isready -U postgres -d root_db && \
+        psql -U postgres -d root_db -t -c "SELECT COUNT(*) FROM pg_database WHERE datname IN ('"'"'n8n_db'"'"', '"'"'nocodb_db'"'"', '"'"'metabase'"'"')" | grep -q 3
+        '
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # NocoDB - Database UI and API platform
+  nocodb:
+    image: nocodb/nocodb:latest
+    container_name: nocodb-aibiztoolkit
+    restart: always
+    # Waits for PostgreSQL and all databases to be healthy before starting
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+    environment:
+      # Database connection string pointing to nocodb_db
+      NC_DB: "pg://postgres-aibiztoolkit:5432?u=postgres&p=password&d=nocodb_db"
+    volumes:
+      - nc_data:/usr/app/data
+
+  # N8N - Workflow automation and integration platform
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n-aibiztoolkit
+    restart: always
+    # Waits for PostgreSQL and all databases to be healthy before starting
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8086:5678"
+    environment:
+      # Timezone configuration for N8N
+      GENERIC_TIMEZONE: "UTC"
+      TZ: "UTC"
+      # N8N security and feature settings
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_RUNNERS_ENABLED: "true"
+      # HTTPS/TLS configuration for secure web access
+      N8N_PROTOCOL: "http"
+      N8N_SECURE_COOKIE: false
+      #N8N_SSL_KEY: "/home/node/.n8n/ssl/key.pem"
+      #N8N_SSL_CERT: "/home/node/.n8n/ssl/cert.pem"
+      # PostgreSQL database configuration for N8N
+      DB_TYPE: "postgresdb"
+      DB_POSTGRESDB_HOST: "postgres-aibiztoolkit"
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_USER: "postgres"
+      DB_POSTGRESDB_PASSWORD: "password"
+      DB_POSTGRESDB_DATABASE: "n8n_db"
+      DB_POSTGRESDB_SCHEMA: "public"
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+  # Ntfy - Simple HTTP-based pub-sub notification service
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy-aibiztoolkit
+    restart: unless-stopped
+    # No strict dependency but starts after N8N for orchestration
+    depends_on:
+      - n8n
+    ports:
+      - "8087:80"
+    environment:
+      # Timezone setting for notification timestamps
+      TZ: "UTC"
+    # Health check to verify ntfy is responding to requests
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 http://localhost:80/v1/health -O - | grep -Eo '\"healthy\"\\s*:\\s*true' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Prevents zombie processes when using healthcheck
+    init: true
+    command:
+      - serve
+
+  # Metabase - Data visualization and business intelligence platform
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase-aibiztoolkit
+    hostname: metabase
+    restart: always
+    # Waits for PostgreSQL and all databases to be healthy before starting
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8088:3000"
+    environment:
+      # Metabase database configuration
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres-aibiztoolkit
+      MB_DB_PORT: "5432"
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: postgres
+      MB_DB_PASS: password
+      # Timezone configuration
+      TZ: "UTC"
+    volumes:
+      - metabase_data:/metabase-data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  # PostgreSQL persistent data storage - using absolute path on host
+  db_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /volume1/docker/aibiztoolkit/db_data
+  # NocoDB persistent data and cache storage
+  nc_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /volume1/docker/aibiztoolkit/nc_data
+  # N8N workflows and credentials storage
+  n8n_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /volume1/docker/aibiztoolkit/n8n_data
+  # Metabase data storage
+  metabase_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /volume1/docker/aibiztoolkit/metabase_data
